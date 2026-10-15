@@ -41,16 +41,36 @@ class TrackingResult:
         }
 
 
-def simulate_tracking(path=None, controller=None, duration=20.0, speed=SPEED, offset=0.5):
+def simulate_tracking(path=None, controller=None, duration=20.0, speed=SPEED, offset=0.5,
+                      k=1.0, endpoint=None, offset_frame="world_y"):
+    """Track until duration or front-axle endpoint crossing.
+
+    endpoint is reference x (meters), not arc length. The default world_y
+    offset preserves Milestone 2; path_normal measures rear-axle displacement
+    along the left normal at the reference start.
+    """
     path = path if path is not None else ReferencePath()
-    controller = controller if controller is not None else StanleyController()
+    if not np.isfinite(k) or k < 0:
+        raise ValueError("Stanley gain must be finite and nonnegative")
+    if controller is not None and k != 1.0:
+        raise ValueError("Specify either controller or a nondefault k")
+    controller = controller if controller is not None else StanleyController(gain=k)
     p = parameters_vehicle2()
     if not np.all(np.isfinite([duration, speed, offset])) or duration <= 0:
         raise ValueError("Finite arguments and positive duration required")
     if not 0 < speed <= p.longitudinal.v_max:
         raise ValueError("Tracking requires a positive speed within vehicle limits")
-    # Front axle starts near x=L; rear axle is offset in world y at x=0.
-    initial = [0.0, path.y(0.0) + offset, 0.0, speed, path.heading(0.0)]
+    endpoint = path.length if endpoint is None else endpoint
+    if not np.isfinite(endpoint) or not 0 < endpoint <= path.length:
+        raise ValueError("Endpoint must lie within the reference x extent")
+    heading = path.heading(0.0)
+    if offset_frame == "world_y":
+        position = [0.0, path.y(0.0) + offset]
+    elif offset_frame == "path_normal":
+        position = [-offset * np.sin(heading), path.y(0.0) + offset * np.cos(heading)]
+    else:
+        raise ValueError("offset_frame must be world_y or path_normal")
+    initial = [*position, 0.0, speed, heading]
 
     def dynamics(t, state):
         rate = controller.command(state, path, p)[1]
@@ -60,8 +80,8 @@ def simulate_tracking(path=None, controller=None, duration=20.0, speed=SPEED, of
         # End when the front axle crosses the endpoint's normal plane.
         yaw = state[4]
         front = state[:2] + (p.a + p.b) * np.array([np.cos(yaw), np.sin(yaw)])
-        tangent = np.array([np.cos(path.heading(path.length)), np.sin(path.heading(path.length))])
-        return float(np.dot(front - [path.length, path.y(path.length)], tangent))
+        tangent = np.array([np.cos(path.heading(endpoint)), np.sin(path.heading(endpoint))])
+        return float(np.dot(front - [endpoint, path.y(endpoint)], tangent))
 
     path_end.terminal = True
     path_end.direction = 1
