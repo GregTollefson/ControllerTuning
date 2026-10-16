@@ -218,3 +218,148 @@ between-sample behavior. Endpoint-plane crossing is suitable for this gentle,
 nonintersecting path; it is not an off-road or lane-departure safety criterion.
 The 20-scenario estimate is a small-sample baseline, and completion-conditioned
 means alone must not be treated as a valid objective for gains that fail runs.
+
+# Milestone 4: Gaussian Process Bayesian Optimization
+
+Reproduce the full experiment and run all tests with the existing environment:
+
+```bash
+MPLCONFIGDIR=/tmp/controller-tuning-mpl .venv/bin/python -m src.optimization
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+The installed scikit-learn supplies `GaussianProcessRegressor`; no Bayesian
+optimization framework or additional package is installed. The CommonRoad
+model, Stanley equations, actuator gain, reference path, and Milestone 1–3
+outputs are unchanged.
+
+`src/objective.py` defines `TrackingObjective(scenarios)`, a reusable callable
+of gain k with fixed scenarios and simulation settings. Its scalar loss is the
+mean of **all** scenario losses. A completed run contributes its front-axle MSE;
+an incomplete, failed, or invalid-loss run contributes **1.0 m²** (equivalent
+to 1 m RMS tracking error, far above the nominal losses in this experiment).
+The penalty is finite, configurable, and does not cap valid completed-run
+losses. It is a modeling choice rather than a physical failure cost. Completion,
+incompletion, failure, and saturation diagnostics remain separately available
+through `diagnostics(k)` and the scenario-level CSVs. Outputs are always finite
+for valid gain inputs; invalid gains are rejected. Exact repeated floating-point
+gains are cached within each objective instance. Failed evaluations are cached
+too, because inputs and dynamics are deterministic.
+
+`src/gp_bo.py` fits a covariance amplitude times a Matérn kernel with ν=2.5.
+Gains are linearly mapped from [0.1, 3.0] to [0, 1]; target losses are normalized
+by their training mean and standard deviation (`normalize_y=True`). The
+covariance amplitude is optimized within [0.001, 1000] and length scale within
+[0.01, 10] in scaled input units. Hyperparameters use scikit-learn's default
+L-BFGS-B optimizer, two additional restarts, and seed 321. `alpha=1e-8` adds
+small diagonal numerical regularization in normalized loss units, rather than
+modeling independent Monte Carlo measurement noise: the fixed-scenario loss is
+effectively deterministic. Prediction exposes mean and standard deviation in
+original MSE units. API reference:
+[scikit-learn GaussianProcessRegressor](https://scikit-learn.org/stable/modules/generated/sklearn.gaussian_process.GaussianProcessRegressor.html).
+
+Expected Improvement (EI) is computed for minimization using SciPy normal
+CDF Φ and PDF φ:
+
+```text
+I(k) = best_observed_loss - mu(k) - xi
+Z(k) = I(k) / sigma(k)
+EI(k) = I(k) Phi(Z(k)) + sigma(k) phi(Z(k))
+```
+
+Exploration `xi=1e-6 m²` is configurable and nonnegative. EI is set to zero
+when predictive SD <= 1e-12; negative numerical artifacts are clipped to zero,
+and extreme floating-point outputs are made finite. Each iteration maximizes
+EI over 4001 equally spaced candidate gains. Candidates within 1e-6 /s of a
+previous observation are excluded; exact EI ties prefer larger uncertainty.
+After the 25th observation the GP is refitted, and the final posterior and EI
+are plotted without requesting another evaluation.
+
+Both methods use five unique initial gains `[0.1, 0.825, 1.55, 2.275, 3.0]`.
+Each has a total budget of **25 gain evaluations**, including those five.
+GP-BO selects 20 more using EI. Random search samples 20 more uniformly from
+[0.1, 3.0] using `default_rng(789)` (resampling only numerical duplicates).
+Both use the exact same 20 training scenarios from seed 123, the same loss
+function, x=100 m endpoint, and 40 s maximum simulated time. Cached shared
+initial results still count as five observations for each method. The fixed
+k=1 baseline training evaluation is additional reporting work, outside both
+search budgets, and cannot influence gain selection.
+
+The best **observed training** gain from each method is frozen before evaluating
+an independent set of 100 scenarios generated with seed 456. The fixed baseline
+and both selected controllers use the same held-out scenarios, allowing paired
+comparisons. Held-out data are not used for acquisition, selection, or retuning.
+If both methods select the same gain, its held-out batch is cached and reused.
+The held-out CSV reports the penalized objective, its square-root RMSE, sample
+SD (`ddof=1`) and Monte Carlo SE of all scenario losses, completion counts, and
+counts of scenarios reaching angle/rate limits. Thus failures cannot disappear
+from held-out metrics either. Completed-only statistics remain available in
+the underlying Monte Carlo diagnostic objects.
+
+New artifacts in `results/`:
+
+- `gp_bo_history.csv` and `random_search_history.csv`: method, evaluation count,
+  gain, objective, and cumulative best objective.
+- `heldout_comparison.csv`: baseline and selected-controller comparisons.
+- `optimization_training_scenarios.csv` and `optimization_heldout_scenarios.csv`:
+  every simulated scenario, gain, outcome, and available diagnostics.
+- `optimization_summary.json`: settings, numerical results, final kernel,
+  captured GP warning messages, physical simulation count, and wall time.
+- `gp_bo_surrogate.png`: final GP mean and 95% pointwise surrogate band.
+- `gp_bo_expected_improvement.png`: EI conditioned on all 25 GP-BO observations.
+- `gp_bo_best_so_far.png`: equal-budget convergence comparison.
+- `gp_bo_heldout_comparison.png`: independent held-out objective comparison.
+
+The GP band is `mu ± 1.96 sigma`: it describes uncertainty of the fitted
+surrogate under its covariance model. It is **not** a confidence interval for
+the population expected tracking loss or a Monte Carlo uncertainty estimate.
+MCSE describes finite-scenario uncertainty in the estimated mean instead.
+A single training seed and random-search seed cannot establish superiority
+of one search strategy. Common scenarios correlate estimates across gains,
+and finite training sets can cause selection bias. The interval restricts
+which gains can be selected; a boundary solution does not establish a global
+optimum. Penalty transitions can make the objective less smooth than the
+Matérn surrogate assumes. Existing kinematic-model and sampled-diagnostic
+limitations still apply. Tests use synthetic functions and mocked scenario
+failures rather than repeating the expensive optimization experiment.
+
+Observed validation results (20 training scenarios; 100 held-out scenarios):
+
+| Controller | Gain k [1/s] | Training MSE [m²] | Held-out MSE [m²] | Held-out RMSE [m] | Scenario-loss SD [m²] | MCSE [m²] |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed baseline | 1.0 | 0.00430127549 | 0.00354016225 | 0.0594992626 | 0.00237638224 | 0.000237638224 |
+| GP-BO selection | 3.0 | 0.00179885103 | 0.00149465656 | 0.0386607883 | 0.00137254709 | 0.000137254709 |
+| Random-search selection | 3.0 | 0.00179885103 | 0.00149465656 | 0.0386607883 | 0.00137254709 | 0.000137254709 |
+
+All three held-out entries completed 100/100 scenarios, with zero incomplete
+or failed runs and zero steering-angle-saturated scenarios. Steering rate
+saturated in 13/100 baseline scenarios and 65/100 scenarios for each selected
+controller. The two selected entries are the same controller evaluated on the
+same held-out inputs, not independent replications.
+
+Both searches attained their final best value in the shared initial design
+at evaluation 5; neither improved it in the remaining 20 evaluations. Their
+best-so-far curves therefore overlap. This experiment shows lower observed
+held-out tracking loss for k=3 than for k=1, with more rate saturation. It
+provides no evidence that GP-BO outperforms random search, nor that k=3 is
+optimal outside the prescribed interval.
+
+The experiment performed **1120 actual vehicle simulations**: 45 distinct
+search gains × 20 scenarios, one additional baseline batch × 20, and two
+unique held-out gains × 100. Shared initial evaluations and identical selected
+held-out gains were cached; both methods still received exactly 25 gain
+observations. All 920 training and 200 distinct held-out simulations completed.
+Measured total experiment wall time was **320.978 s** (about 5.35 minutes),
+including GP fitting, CSVs, and plots; times depend on the machine. The full
+suite passed **26 tests** in 1.656 s; test simulations are outside the reported
+experiment count and runtime.
+
+GP fitting emitted **26 L-BFGS abnormal line-search termination convergence
+warnings** across hyperparameter restarts/refits. They are retained verbatim
+in `optimization_summary.json`; they were not silently discarded. Inputs and
+targets were already scaled. Fitting returned models and predictions remained
+finite; no vehicle integrations failed. The final fitted kernel was approximately
+`28.5**2 * Matern(length_scale=1.92, nu=2.5)` in scaled coordinates. These warnings
+mean numerical hyperparameter convergence is not assured; the surrogate band
+and acquisition choices should be interpreted with that limitation. No settings
+were retuned using the held-out results.
